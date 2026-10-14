@@ -1,0 +1,204 @@
+name: Release
+
+# Fully automatic release pipeline:
+#   * push to main        -> reads the workspace version from Cargo.toml; if that
+#                            version has not been released yet, it builds all
+#                            platforms and publishes a GitHub Release (the tag
+#                            is created automatically at the pushed commit).
+#   * push of a v* tag    -> builds all platforms and releases exactly that tag.
+#   * workflow_dispatch  -> same as the main-branch path, on demand.
+#
+# Publishing is idempotent: re-running a workflow for an already-released
+# version is a no-op, and re-running a failed release re-uploads the assets.
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  prepare:
+    name: Decide whether to release
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+      tag: ${{ steps.ver.outputs.tag }}
+      should_release: ${{ steps.ver.outputs.should_release }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute version / tag / decision
+        id: ver
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          VERSION="$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')"
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            TAG="${GITHUB_REF#refs/tags/}"
+          else
+            TAG="v${VERSION}"
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+          # Skip when this tag was already released (push to main of an
+          # already-released version, or a re-run of a finished release).
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release ${TAG} already exists - nothing to do." | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Will release ${TAG}." | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "should_release=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: prepare
+    if: needs.prepare.outputs.should_release == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            archive: tar.gz
+          - os: macos-13
+            target: x86_64-apple-darwin
+            archive: tar.gz
+    runs-on: ${{ matrix.os }}
+    env:
+      TAG: ${{ needs.prepare.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install GUI build dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxkbcommon-dev libwayland-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build release binaries
+        shell: bash
+        run: |
+          cargo build --release --locked --target ${{ matrix.target }} \
+            -p gg-lan-gui -p gg-lan-agent -p gg-lan-server -p gg-lan-cli
+
+      - name: Strip binaries (unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          for bin in gg-lan gg-lan-agent gg-lan-server gg-lan-cli; do
+            strip "target/${{ matrix.target }}/release/${bin}"
+          done
+
+      - name: Package (tar.gz)
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          set -euo pipefail
+          NAME="gg-lan-${TAG}-${{ matrix.target }}"
+          mkdir -p "dist/${NAME}/gg-lan"
+          for bin in gg-lan gg-lan-agent gg-lan-server gg-lan-cli; do
+            cp "target/${{ matrix.target }}/release/${bin}" "dist/${NAME}/gg-lan/"
+          done
+          cp README.md LICENSE "dist/${NAME}/gg-lan/"
+          tar -czf "dist/${NAME}.tar.gz" -C "dist/${NAME}" gg-lan
+          rm -rf "dist/${NAME}"
+          ls -la dist/
+
+      - name: Package (zip)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $name = "gg-lan-${env:TAG}-${{ matrix.target }}"
+          New-Item -ItemType Directory -Force -Path "dist/${name}/gg-lan" | Out-Null
+          foreach ($bin in 'gg-lan','gg-lan-agent','gg-lan-server','gg-lan-cli') {
+            Copy-Item "target/${{ matrix.target }}/release/$bin.exe" "dist/${name}/gg-lan/"
+          }
+          Copy-Item README.md, LICENSE "dist/${name}/gg-lan/"
+          Compress-Archive -Path "dist/${name}/gg-lan" -DestinationPath "dist/${name}.zip"
+          Remove-Item -Recurse "dist/${name}"
+          Get-ChildItem dist/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: gg-lan-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish GitHub Release
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    if: needs.prepare.outputs.should_release == 'true'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all platform archives
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: |
+          cd dist
+          sha256sum *.tar.gz *.zip > SHA256SUMS.txt
+          ls -la
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          name: GG LAN ${{ needs.prepare.outputs.tag }}
+          body: |
+            GG LAN ${{ needs.prepare.outputs.tag }} — LAN over the Internet.
+
+            **Downloads**
+            | Platform | Archive |
+            |----------|---------|
+            | Windows (x64) | `*-x86_64-pc-windows-msvc.zip` |
+            | Linux (x64) | `*-x86_64-unknown-linux-gnu.tar.gz` |
+            | macOS (Apple Silicon) | `*-aarch64-apple-darwin.tar.gz` |
+            | macOS (Intel) | `*-x86_64-apple-darwin.tar.gz` |
+
+            Unpack the archive and run `gg-lan` (the desktop client). It manages
+            the bundled `gg-lan-agent` automatically; `gg-lan-server` is only
+            needed on the machine hosting a network. See the README for the
+            quick start.
+          files: dist/*
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(needs.prepare.outputs.tag, '-') }}

@@ -1,0 +1,21 @@
+[package]
+name = "gg-lan-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "GG LAN coordinator/relay server"
+
+[[bin]]
+name = "gg-lan-server"
+path = "src/main.rs"
+
+[dependencies]
+gg-lan-core = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+x25519-dalek = { workspace = true }
+rand = { workspace = true }
+base64 = { workspace = true }
+anyhow = { workspace = true }
+tiny_http = { workspace = true }

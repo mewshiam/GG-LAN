@@ -1,0 +1,37 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/core",
+    "crates/server",
+    "crates/agent",
+    "crates/cli",
+    "crates/e2e",
+    "crates/gui",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/mewshiam/GG-LAN"
+
+[workspace.dependencies]
+gg-lan-core = { path = "crates/core" }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "time", "sync", "macros", "signal"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+chacha20poly1305 = "0.10"
+hkdf = "0.12"
+sha2 = "0.10"
+rand = "0.8"
+base64 = "0.22"
+anyhow = "1"
+thiserror = "2"
+tiny_http = "0.12"
+clap = { version = "4", features = ["derive"] }
+libc = "0.2"
+
+[profile.release]
+opt-level = 2
+lto = "thin"

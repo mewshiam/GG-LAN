@@ -1,0 +1,10 @@
+# build artifacts
+/target
+**/*.rs.bk
+
+# local state
+*.key
+*.log
+.idea/
+.vscode/
+.DS_Store

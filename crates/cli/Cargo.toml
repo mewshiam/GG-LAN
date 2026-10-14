@@ -1,0 +1,15 @@
+[package]
+name = "gg-lan-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "GG LAN operator CLI"
+
+[[bin]]
+name = "gg-lan-cli"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+serde_json = { workspace = true }

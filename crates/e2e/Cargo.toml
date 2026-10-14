@@ -1,0 +1,14 @@
+[package]
+name = "gg-lan-e2e"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "GG LAN end-to-end test harness (spawns server + agents, verifies ping)"
+
+[[bin]]
+name = "gg-lan-e2e"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+serde_json = { workspace = true }

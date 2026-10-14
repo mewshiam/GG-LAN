@@ -1,0 +1,20 @@
+[package]
+name = "gg-lan-gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "GG LAN native desktop client (Radmin VPN-style)"
+
+[[bin]]
+name = "gg-lan"
+path = "src/main.rs"
+
+[dependencies]
+gg-lan-core = { workspace = true }
+eframe = "0.36"
+egui = "0.36"
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+rand = { workspace = true }
+dirs = "7"
