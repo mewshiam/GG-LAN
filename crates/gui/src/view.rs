@@ -1,8 +1,17 @@
-//! GG LAN native client UI (eframe/egui, Radmin VPN-style layout).
+//! GG LAN native client UI — Material 3 inspired composition layer.
+//!
+//! This file orchestrates screens (header, sidebar, dashboard, dialogs);
+//! the visual language lives in [`crate::theme`], the widgets in
+//! [`crate::components`] and [`crate::icons`]. All networking/model logic is
+//! untouched from the original client.
 
+use crate::components::{self, BtnStyle, Snack, SnackKind};
+use crate::icons::{self, Icon};
 use crate::model::*;
-use crate::theme::*;
-use egui::{Align2, Color32, CornerRadius, RichText, Sense, Stroke, Ui, Vec2};
+use crate::theme::{
+    self, fmt_bps, fmt_bytes, Palette, StatusKind, R_MD, R_XL, SP1, SP2, SP3, SP4, SP6,
+};
+use egui::{vec2, Align2, Color32, CornerRadius, Pos2, Rect, RichText, Sense, Stroke, Ui, Vec2};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -22,18 +31,25 @@ pub struct GgApp {
     pub join_server: String,
     pub join_code: String,
     pub join_now: bool,
+    join_server_error: Option<String>,
+    join_code_error: Option<String>,
 
     pub create_open: bool,
     pub create_name: String,
-    pub create_mode: String,
+    pub create_mode: &'static str,
     pub create_now: bool,
 
     pub settings_open: bool,
+    settings_backup: Option<GuiConfig>,
+
     /// Set by dialog bodies to request closing (the `open` bool is borrowed
     /// by the window while the body runs).
     dlg_close: bool,
-    pub toast: Option<(String, Instant, bool)>,
-    pub confirm_remove: Option<(usize, Instant)>,
+    remove_target: Option<usize>,
+
+    pub snacks: Vec<Snack>,
+    /// Cached "share this" LAN address per coordinator port.
+    lan_hints: HashMap<u16, String>,
 }
 
 impl eframe::App for GgApp {
@@ -49,28 +65,33 @@ impl GgApp {
         let _ = std::fs::create_dir_all(&cfg_dir);
         let identity = ensure_identity(&cfg_dir);
         let nets: Vec<NetEntry> = cfg.networks.iter().cloned().map(NetEntry::new).collect();
+        let selected = (!nets.is_empty()).then_some(0);
         let mut app = Self {
             nets,
             cfg,
             cfg_path,
-            cfg_dir: cfg_dir.clone(),
+            cfg_dir,
             identity,
             bus: EventBus::default(),
             pings: HashMap::new(),
-            selected: None,
+            selected,
             join_open: false,
             join_name: String::new(),
             join_server: String::new(),
             join_code: String::new(),
             join_now: true,
+            join_server_error: None,
+            join_code_error: None,
             create_open: false,
             create_name: String::new(),
-            create_mode: "mesh".into(),
+            create_mode: "mesh",
             create_now: true,
             settings_open: false,
+            settings_backup: None,
             dlg_close: false,
-            toast: None,
-            confirm_remove: None,
+            remove_target: None,
+            snacks: Vec::new(),
+            lan_hints: HashMap::new(),
         };
         let auto: Vec<usize> = app
             .nets
@@ -104,7 +125,7 @@ impl GgApp {
                     self.cfg.networks[i].server = self.nets[i].cfg.server.clone();
                 }
                 Err(e) => {
-                    self.toast(format!("Coordinator failed: {e:#}"), false);
+                    self.snack(format!("Coordinator failed: {e:#}"), SnackKind::Error);
                     return;
                 }
             }
@@ -118,7 +139,7 @@ impl GgApp {
                 self.cfg.networks[i].enabled = true;
                 self.save();
             }
-            Err(e) => self.toast(format!("Agent failed: {e:#}"), false),
+            Err(e) => self.snack(format!("Agent failed: {e:#}"), SnackKind::Error),
         }
     }
 
@@ -159,8 +180,12 @@ impl GgApp {
             self.cfg.networks.remove(i);
         }
         self.pings.clear();
-        self.selected = None;
-        self.confirm_remove = None;
+        self.selected = if self.nets.is_empty() {
+            None
+        } else {
+            Some(i.min(self.nets.len() - 1))
+        };
+        self.remove_target = None;
         self.save();
     }
 
@@ -170,8 +195,15 @@ impl GgApp {
         }
     }
 
-    fn toast(&mut self, text: impl Into<String>, ok: bool) {
-        self.toast = Some((text.into(), Instant::now(), ok));
+    fn snack(&mut self, text: impl Into<String>, kind: SnackKind) {
+        self.snacks.push(Snack {
+            text: text.into(),
+            kind,
+            at: Instant::now(),
+        });
+        if self.snacks.len() > 6 {
+            self.snacks.remove(0);
+        }
     }
 
     // ------------------------------------------------------------ events
@@ -198,7 +230,10 @@ impl GgApp {
         for i in 0..self.nets.len() {
             if self.nets[i].take_crash() {
                 let name = self.nets[i].cfg.name.clone();
-                self.toast(format!("Agent for '{name}' stopped — see event log"), false);
+                self.snack(
+                    format!("Agent for \u{201c}{name}\u{201d} stopped — see the event log"),
+                    SnackKind::Error,
+                );
             }
         }
     }
@@ -210,119 +245,210 @@ impl GgApp {
         self.pump_events();
         ctx.request_repaint_after(Duration::from_millis(400));
 
-        egui::Panel::top("gg_header")
-            .frame(header_frame())
-            .show(ui, |ui| self.header(ui));
-        egui::Panel::left("gg_nets")
-            .exact_size(312.0)
-            .frame(panel_frame())
-            .show(ui, |ui| self.sidebar(ui));
-        egui::CentralPanel::default()
-            .frame(panel_frame())
-            .show(ui, |ui| self.central(ui));
+        let pal = theme::ThemePrefs::parse(&self.cfg.theme).palette(&ctx);
+        theme::apply_visuals(&ctx, pal);
 
-        self.dialogs(&ctx);
-        self.draw_toast(&ctx);
+        // Escape closes any open dialog, like a native modal.
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.join_open = false;
+            self.create_open = false;
+            if self.settings_open {
+                // dismissed without saving -> revert any in-dialog edits
+                if let Some(b) = self.settings_backup.take() {
+                    self.cfg = b;
+                }
+            }
+            self.settings_open = false;
+            self.remove_target = None;
+            self.join_server_error = None;
+            self.join_code_error = None;
+        }
+
+        egui::Panel::top("gg_header")
+            .exact_size(52.0)
+            .frame(egui::Frame::new().fill(pal.surface))
+            .show(ui, |ui| self.header(ui, pal));
+
+        egui::Panel::left("gg_nets")
+            .exact_size(292.0)
+            .frame(
+                egui::Frame::new()
+                    .fill(pal.surface_low)
+                    .inner_margin(egui::Margin::same(12)),
+            )
+            .show(ui, |ui| self.sidebar(ui, pal));
+
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::new()
+                    .fill(pal.surface)
+                    .inner_margin(egui::Margin::same(20)),
+            )
+            .show(ui, |ui| self.central(ui, pal));
+
+        self.dialogs(&ctx, pal);
+        components::snackbars(&ctx, pal, &mut self.snacks);
     }
 
-    fn header(&mut self, ui: &mut Ui) {
+    fn header(&mut self, ui: &mut Ui, pal: &Palette) {
         ui.horizontal_centered(|ui| {
-            let (r, _) = ui.allocate_exact_size(Vec2::splat(30.0), Sense::hover());
+            ui.add_space(SP2);
+            let (rect, _) = ui.allocate_exact_size(Vec2::splat(30.0), Sense::hover());
             let p = ui.painter();
-            p.rect_filled(r, CornerRadius::same(8), ACCENT);
-            p.text(
-                r.center(),
-                Align2::CENTER_CENTER,
-                "GG",
-                egui::FontId::proportional(13.5),
-                Color32::WHITE,
-            );
-            ui.add_space(8.0);
-            ui.label(RichText::new("GG LAN").size(16.0).strong().color(INK));
+            p.rect_filled(rect, CornerRadius::same(9), pal.primary);
+            icons::draw(p, Icon::Lan, rect.shrink(7.0), pal.on_primary);
+            ui.add_space(SP2);
             ui.label(
-                RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
-                    .size(11.0)
-                    .color(MUTED),
+                RichText::new("GG LAN")
+                    .size(15.0)
+                    .strong()
+                    .color(pal.on_surface),
+            );
+            ui.label(
+                theme::caption(format!("v{}", env!("CARGO_PKG_VERSION")))
+                    .color(pal.on_surface_variant),
             );
 
+            // understated connection summary
+            let total = self.nets.len();
+            if total > 0 {
+                let connected = self
+                    .nets
+                    .iter_mut()
+                    .map(|n| n.state())
+                    .filter(|s| matches!(s, NetState::Connected))
+                    .count();
+                ui.add_space(SP4);
+                let kind = if connected == total {
+                    StatusKind::Connected
+                } else if connected > 0 {
+                    StatusKind::Waiting
+                } else {
+                    StatusKind::Offline
+                };
+                let sc = pal.status(kind);
+                components::status_dot(ui, sc.fg, false);
+                ui.label(
+                    theme::caption(format!("{connected} of {total} connected"))
+                        .color(pal.on_surface_variant),
+                );
+            }
+
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .button(RichText::new("Settings").size(12.5))
-                    .on_hover_text("Nickname, binaries, config location")
-                    .clicked()
-                {
+                ui.add_space(SP2);
+                let sb = components::icon_button(ui, pal, Icon::Settings, 32.0, true);
+                if sb.clicked() {
+                    self.settings_backup = Some(self.cfg.clone());
                     self.settings_open = true;
                 }
-                let any_on = self.nets.iter().any(|n| n.agent.is_some());
-                let (label, enable) = if any_on {
-                    ("Disconnect all", false)
-                } else {
-                    ("Connect all", true)
-                };
-                let b = egui::Button::new(RichText::new(label).size(12.5).color(Color32::WHITE));
-                let b = if enable {
-                    b.fill(ACCENT)
-                } else {
-                    b.fill(Color32::from_rgb(189, 193, 198))
-                };
-                if ui.add(b).clicked() {
-                    if enable {
-                        for i in 0..self.nets.len() {
-                            self.connect(i);
-                        }
+                sb.on_hover_text("Settings — nickname, theme, binaries");
+
+                if !self.nets.is_empty() {
+                    let any_on = self.nets.iter().any(|n| n.agent.is_some());
+                    let (label, on) = if any_on {
+                        ("Disconnect all", false)
                     } else {
-                        for i in 0..self.nets.len() {
-                            self.disconnect(i);
+                        ("Connect all", true)
+                    };
+                    if components::button(ui, pal, BtnStyle::Text, Some(Icon::Power), label, true)
+                        .clicked()
+                    {
+                        if on {
+                            for i in 0..self.nets.len() {
+                                self.connect(i);
+                            }
+                        } else {
+                            for i in 0..self.nets.len() {
+                                self.disconnect(i);
+                            }
                         }
                     }
                 }
             });
         });
+        let rect = ui.max_rect();
+        ui.painter().hline(
+            rect.left()..=rect.right(),
+            rect.bottom() - 0.5,
+            Stroke::new(1.0, pal.outline_variant),
+        );
     }
 
     // ------------------------------------------------------------ sidebar
 
-    fn sidebar(&mut self, ui: &mut Ui) {
-        ui.add_space(12.0);
+    fn sidebar(&mut self, ui: &mut Ui, pal: &Palette) {
         ui.horizontal(|ui| {
-            ui.label(RichText::new("NETWORKS").size(11.5).strong().color(MUTED));
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .button(RichText::new("+ Host").size(12.0))
-                    .on_hover_text("Create and host a new network on this machine")
-                    .clicked()
-                {
-                    self.create_open = true;
-                }
-                if ui
-                    .button(RichText::new("+ Join").size(12.0))
-                    .on_hover_text("Join an existing network with a join code")
-                    .clicked()
-                {
-                    self.join_open = true;
-                }
-            });
+            ui.label(
+                RichText::new("Networks")
+                    .size(14.0)
+                    .strong()
+                    .color(pal.on_surface),
+            );
+            if !self.nets.is_empty() {
+                ui.label(
+                    theme::caption(format!("{}", self.nets.len())).color(pal.on_surface_variant),
+                );
+            }
         });
-        ui.add_space(4.0);
+        ui.add_space(SP2);
+
+        let mut open_join = false;
+        let mut open_host = false;
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = SP1;
+            let w = ((ui.available_width() - SP1) / 2.0).floor();
+            if components::button_exact(
+                ui,
+                pal,
+                BtnStyle::Outlined,
+                Some(Icon::Globe),
+                "Join",
+                vec2(w, 36.0),
+            )
+            .clicked()
+            {
+                open_join = true;
+            }
+            if components::button_exact(
+                ui,
+                pal,
+                BtnStyle::Filled,
+                Some(Icon::Server),
+                "Host",
+                vec2(w, 36.0),
+            )
+            .clicked()
+            {
+                open_host = true;
+            }
+        });
+        if open_join {
+            self.join_open = true;
+            self.join_server_error = None;
+            self.join_code_error = None;
+        }
+        if open_host {
+            self.create_open = true;
+        }
+        ui.add_space(SP3);
 
         let mut toggle: Option<(usize, bool)> = None;
         let mut select: Option<usize> = None;
-
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 if self.nets.is_empty() {
-                    ui.add_space(16.0);
-                    ui.label(
-                        RichText::new(
-                            "No networks yet.\nJoin a friend's network with a code,\nor host your own LAN party.",
-                        )
-                        .size(12.5)
-                        .color(MUTED),
+                    ui.add_space(SP4);
+                    components::empty_state(
+                        ui,
+                        pal,
+                        Icon::Globe,
+                        "No networks yet",
+                        "Join a friend's network with a code,\nor host your own LAN party.",
                     );
                 }
                 for i in 0..self.nets.len() {
-                    self.net_card(ui, i, &mut toggle, &mut select);
+                    self.net_row(ui, pal, i, &mut toggle, &mut select);
                 }
             });
 
@@ -330,6 +456,8 @@ impl GgApp {
             self.selected = Some(i);
         }
         if let Some((i, on)) = toggle {
+            // Toggling a network also shows its dashboard.
+            self.selected = Some(i);
             if on {
                 self.connect(i);
             } else {
@@ -338,19 +466,19 @@ impl GgApp {
         }
     }
 
-    fn net_card(
+    fn net_row(
         &mut self,
         ui: &mut Ui,
+        pal: &Palette,
         i: usize,
         toggle: &mut Option<(usize, bool)>,
         select: &mut Option<usize>,
     ) {
         let selected = self.selected == Some(i);
+        let st = self.nets[i].state();
         let name = self.nets[i].cfg.name.clone();
-        let server = self.nets[i].cfg.server.clone();
         let local = self.nets[i].cfg.local;
         let mode = self.nets[i].cfg.mode.clone();
-        let st = self.nets[i].state();
         let peers_n = self.nets[i]
             .status
             .as_ref()
@@ -358,65 +486,107 @@ impl GgApp {
             .and_then(|p| p.as_array())
             .map(|a| a.len())
             .unwrap_or(0);
-        let mut on = self.nets[i].cfg.enabled;
+        let alive = matches!(
+            st,
+            NetState::Starting | NetState::Waiting | NetState::Connected
+        );
+        let mut on = alive;
 
-        let (fg, bg) = state_colors(st);
-        let card = egui::Frame::group(ui.style())
-            .fill(if selected { ACCENT_SOFT } else { CARD })
-            .stroke(Stroke::new(
-                if selected { 1.6 } else { 1.0 },
-                if selected { ACCENT } else { HAIRLINE },
-            ))
-            .corner_radius(10)
-            .inner_margin(egui::Margin::same(10))
+        let id = egui::Id::new("netrow").with(i);
+        // hover from the previous frame's response (stable across frames)
+        let hovered = ui
+            .ctx()
+            .read_response(id)
+            .map(|r| r.hovered())
+            .unwrap_or(false);
+        let bg = if selected {
+            if hovered {
+                pal.tonal_hover(pal.secondary_container)
+            } else {
+                pal.secondary_container
+            }
+        } else if hovered {
+            pal.surface_container
+        } else {
+            Color32::TRANSPARENT
+        };
+        let fg = if selected {
+            pal.on_secondary_container
+        } else {
+            pal.on_surface
+        };
+        let meta_fg = if selected {
+            pal.over_surface(pal.on_secondary_container, 0.25)
+        } else {
+            pal.on_surface_variant
+        };
+
+        let mut meta = if mode == "hub" { "hub" } else { "mesh" }.to_string();
+        meta.push_str(&format!(
+            " \u{00b7} {peers_n} peer{}",
+            if peers_n == 1 { "" } else { "s" }
+        ));
+        if local {
+            meta.push_str(" \u{00b7} host");
+        }
+        let pulse = matches!(st, NetState::Starting | NetState::Waiting);
+
+        // The row-level click target must not overlap the switch: egui's
+        // hit-test gives a click to the topmost (last registered) widget, and
+        // the row interact is registered after the frame contents — an
+        // overlapping rect would swallow switch clicks.
+        let mut sw_rect = Rect::ZERO;
+        let out = egui::Frame::new()
+            .fill(bg)
+            .corner_radius(CornerRadius::same(R_MD))
+            .inner_margin(egui::Margin::symmetric(10, 7))
             .show(ui, |ui| {
                 ui.set_min_width(ui.available_width());
-                ui.horizontal_top(|ui| {
-                    pill(ui, st.label(), fg, bg);
-                    if local {
-                        pill(ui, "HOST", ACCENT, ACCENT_SOFT);
-                    }
+                ui.horizontal(|ui| {
+                    ui.set_min_height(40.0);
+                    // switch reserved on the right, content fills the left
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let sw = switch(ui, &mut on);
+                        let sw = components::switch(ui, pal, &mut on);
+                        sw_rect = sw.rect;
                         if sw.changed() {
                             *toggle = Some((i, on));
                         }
-                        sw.on_hover_text("Connect / disconnect");
+                        sw.on_hover_text(if alive { "Disconnect" } else { "Connect" });
+
+                        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                            components::status_dot(ui, pal.status(kind_of(st)).fg, pulse);
+                            ui.add_space(4.0);
+                            let avail = ui.available_width();
+                            ui.vertical(|ui| {
+                                ui.set_max_width((avail - 6.0).max(64.0));
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(name.as_str()).size(13.5).strong().color(fg),
+                                    )
+                                    .truncate(),
+                                );
+                                ui.label(RichText::new(meta.as_str()).size(11.0).color(meta_fg));
+                            });
+                        });
                     });
                 });
-                ui.add_space(2.0);
-                ui.label(RichText::new(name).size(14.0).strong().color(INK));
-                ui.label(
-                    RichText::new(format!(
-                        "{server} · {peers_n} peer{}",
-                        if peers_n == 1 { "" } else { "s" }
-                    ))
-                    .size(11.5)
-                    .color(MUTED),
-                );
-                ui.label(
-                    RichText::new(if mode == "hub" {
-                        "hub mode — traffic relayed"
-                    } else {
-                        "mesh mode — direct P2P"
-                    })
-                    .size(10.5)
-                    .color(MUTED),
-                );
             });
-        let rect = card.response.rect;
-        let resp = ui.interact(rect, egui::Id::new("netcard").with(i), Sense::click());
+        let mut row_rect = out.response.rect;
+        if sw_rect.max.x > row_rect.min.x && sw_rect.max.x <= row_rect.max.x {
+            row_rect.max.x = sw_rect.min.x;
+        }
+        let resp = ui.interact(row_rect, id, Sense::click());
         if resp.clicked() {
             *select = Some(i);
         }
-        ui.add_space(6.0);
+        ui.add_space(SP1);
     }
 
     // ------------------------------------------------------------ central
 
-    fn central(&mut self, ui: &mut Ui) {
+    fn central(&mut self, ui: &mut Ui, pal: &Palette) {
         let Some(i) = self.selected.filter(|i| *i < self.nets.len()) else {
-            self.hero(ui);
+            self.welcome(ui, pal);
             return;
         };
         let name = self.nets[i].cfg.name.clone();
@@ -426,375 +596,612 @@ impl GgApp {
         let status = self.nets[i].status.clone();
         let log: Vec<String> = self.nets[i].log.iter().cloned().collect();
         let status_port = self.nets[i].agent.as_ref().map(|a| a.status_port);
+        let agent_up = self.nets[i].agent.is_some();
+        let kind = kind_of(st);
 
-        ui.add_space(12.0);
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                // ---- title row
-                let mut do_remove = false;
-                ui.horizontal_centered(|ui| {
-                    ui.label(RichText::new(name).size(20.0).strong().color(INK));
-                    let (fg, bg) = state_colors(st);
-                    pill(ui, st.label(), fg, bg);
-                    if local {
-                        pill(ui, "HOSTED HERE", ACCENT, ACCENT_SOFT);
-                    }
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        // remove with confirm
-                        if let Some((ci, at)) = self.confirm_remove {
-                            if ci == i && at.elapsed() < Duration::from_secs(3) {
-                                if ui
-                                    .button(RichText::new("Really remove?").size(12.0).color(BAD))
-                                    .clicked()
-                                {
-                                    do_remove = true;
-                                }
-                                if ui.button(RichText::new("Keep").size(12.0)).clicked() {
-                                    self.confirm_remove = None;
-                                }
-                            } else {
-                                self.confirm_remove = None;
-                            }
-                        }
-                        if self.confirm_remove.is_none()
-                            && ui
-                                .button(RichText::new("Remove").size(12.0).color(MUTED))
-                                .on_hover_text("Forget this network")
-                                .clicked()
-                        {
-                            self.confirm_remove = Some((i, Instant::now()));
-                        }
-                        // connect / disconnect
-                        if self.nets[i].agent.is_some() {
-                            if ui.button(RichText::new("Disconnect").size(12.0)).clicked() {
-                                self.disconnect(i);
-                            }
-                        } else if ui
-                            .add(
-                                egui::Button::new(
-                                    RichText::new("Connect").size(12.0).color(Color32::WHITE),
-                                )
-                                .fill(ACCENT),
-                            )
-                            .clicked()
-                        {
-                            self.connect(i);
-                        }
-                    });
-                });
-                if do_remove {
-                    self.remove_net(i);
-                    return;
+                self.dash_heading(ui, pal, i, &name, &server, local, kind, st, agent_up);
+                ui.add_space(SP3);
+
+                self.metrics_card(ui, pal, kind, st, &status);
+                ui.add_space(SP3);
+
+                if local {
+                    self.share_card(ui, pal, i);
+                    ui.add_space(SP3);
                 }
-                ui.label(
-                    RichText::new(format!("coordinator {server}"))
-                        .size(11.5)
-                        .color(MUTED),
-                );
-                ui.add_space(10.0);
 
-                // ---- stat cards
-                let (my_ip, peers, rx_now, tx_now, rx_total, tx_total) = stat_snapshot(&status);
-                ui.horizontal(|ui| {
-                    stat_card(ui, "STATUS", st.label().into(), state_colors(st).0);
-                    stat_card(ui, "MY ADDRESS", my_ip.clone(), INK);
-                    stat_card(
-                        ui,
-                        "PEERS",
-                        peers.len().to_string(),
-                        if peers.is_empty() { MUTED } else { INK },
-                    );
-                    stat_card(ui, "DOWNLOAD", fmt_bps(rx_now), GOOD);
-                    stat_card(ui, "UPLOAD", fmt_bps(tx_now), WARN);
-                    stat_card(ui, "TOTAL TRAFFIC", fmt_bytes(rx_total + tx_total), INK);
-                });
-                ui.add_space(10.0);
+                self.traffic_card(ui, pal, &status);
+                ui.add_space(SP3);
 
-                // ---- traffic charts
-                let (rx_series, tx_series) = series_snapshot(&status);
-                card_frame(ui).show(ui, |ui| {
-                    ui.label(
-                        RichText::new("TRAFFIC — LAST 60 SECONDS")
-                            .size(11.0)
-                            .strong()
-                            .color(MUTED),
-                    );
-                    ui.columns(2, |cols| {
-                        let inner = spark_chart(&mut cols[0], &rx_series, GOOD, 110.0);
-                        cols[0].painter().text(
-                            inner.right_top(),
-                            Align2::RIGHT_TOP,
-                            format!("down {rx_now}"),
-                            egui::FontId::proportional(11.0),
-                            GOOD,
-                        );
-                        let inner = spark_chart(&mut cols[1], &tx_series, WARN, 110.0);
-                        cols[1].painter().text(
-                            inner.right_top(),
-                            Align2::RIGHT_TOP,
-                            format!("up {tx_now}"),
-                            egui::FontId::proportional(11.0),
-                            WARN,
-                        );
-                    });
-                });
-                ui.add_space(10.0);
+                self.peers_card(ui, pal, i, &status, status_port);
+                ui.add_space(SP3);
 
-                // ---- peers table
-                card_frame(ui).show(ui, |ui| {
-                    ui.label(RichText::new("PEERS").size(11.0).strong().color(MUTED));
-                    ui.add_space(4.0);
-                    if peers.is_empty() {
-                        ui.label(
-                            RichText::new("No other peers connected to this network yet.")
-                                .size(12.0)
-                                .color(MUTED),
-                        );
-                    } else {
-                        egui::Grid::new("peers")
-                            .num_columns(6)
-                            .striped(true)
-                            .min_row_height(30.0)
-                            .spacing([18.0, 2.0])
-                            .show(ui, |ui| {
-                                for h in ["NAME", "IP", "PATH", "RTT", "TRAFFIC", ""] {
-                                    ui.label(RichText::new(h).size(10.5).strong().color(MUTED));
-                                }
-                                ui.end_row();
-                                for p in &peers {
-                                    ui.label(RichText::new(p.name.clone()).size(12.5).color(INK));
-                                    ui.label(
-                                        RichText::new(p.ip.clone())
-                                            .size(12.5)
-                                            .color(MUTED)
-                                            .monospace(),
-                                    );
-                                    let (fg, bg) = path_colors(&p.path);
-                                    pill(ui, &p.path, fg, bg);
-                                    ui.label(
-                                        RichText::new(
-                                            p.rtt
-                                                .map(|r| format!("{r} ms"))
-                                                .unwrap_or_else(|| "—".into()),
-                                        )
-                                        .size(12.5)
-                                        .color(INK),
-                                    );
-                                    ui.label(
-                                        RichText::new(fmt_bytes(p.bytes_in + p.bytes_out))
-                                            .size(12.5)
-                                            .color(MUTED),
-                                    );
-                                    ui.horizontal(|ui| {
-                                        if let Some(port) = status_port {
-                                            if ui.button(RichText::new("Ping").size(11.0)).clicked()
-                                            {
-                                                self.pings.insert((i, p.ip.clone()), "…".into());
-                                                fire_ping(
-                                                    i,
-                                                    port,
-                                                    p.ip.clone(),
-                                                    self.bus.tx.clone(),
-                                                );
-                                            }
-                                            if let Some(res) = self.pings.get(&(i, p.ip.clone())) {
-                                                ui.label(
-                                                    RichText::new(res.clone())
-                                                        .size(11.0)
-                                                        .color(MUTED),
-                                                );
-                                            }
-                                        } else {
-                                            ui.label(
-                                                RichText::new("offline").size(11.0).color(MUTED),
-                                            );
-                                        }
-                                    });
-                                    ui.end_row();
-                                }
-                            });
-                    }
-                });
-                ui.add_space(10.0);
-
-                // ---- event log
-                egui::CollapsingHeader::new(
-                    RichText::new("EVENT LOG").size(11.0).strong().color(MUTED),
-                )
-                .default_open(false)
-                .show(ui, |ui| {
-                    egui::ScrollArea::vertical()
-                        .max_height(180.0)
-                        .stick_to_bottom(true)
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            for l in log.iter().rev() {
-                                ui.label(
-                                    RichText::new(l.clone()).size(11.0).monospace().color(MUTED),
-                                );
-                            }
-                        });
-                });
-                ui.add_space(8.0);
+                self.log_section(ui, pal, &log);
+                ui.add_space(SP1);
             });
     }
 
-    fn hero(&mut self, ui: &mut Ui) {
-        ui.vertical_centered(|ui| {
-            ui.add_space(80.0);
-            let (r, _) = ui.allocate_exact_size(Vec2::splat(64.0), Sense::hover());
-            let p = ui.painter();
-            p.rect_filled(r, CornerRadius::same(16), ACCENT);
-            p.text(
-                r.center(),
-                Align2::CENTER_CENTER,
-                "GG",
-                egui::FontId::proportional(28.0),
-                Color32::WHITE,
-            );
-            ui.add_space(16.0);
-            ui.label(RichText::new("GG LAN").size(28.0).strong().color(INK));
-            ui.add_space(6.0);
-            ui.label(
-                RichText::new("A virtual LAN for your games — anywhere.")
-                    .size(14.0)
-                    .color(MUTED),
-            );
-            ui.add_space(6.0);
-            ui.label(
-                RichText::new("Encrypted peer-to-peer overlay network with NAT traversal,")
-                    .size(12.0)
-                    .color(MUTED),
-            );
-            ui.label(
-                RichText::new("designed for LAN parties over the internet.")
-                    .size(12.0)
-                    .color(MUTED),
-            );
-            ui.add_space(22.0);
-            ui.horizontal(|ui| {
-                let b = egui::Button::new(
-                    RichText::new("Join a network")
-                        .size(13.0)
-                        .color(Color32::WHITE),
+    #[allow(clippy::too_many_arguments)]
+    fn dash_heading(
+        &mut self,
+        ui: &mut Ui,
+        pal: &Palette,
+        i: usize,
+        name: &str,
+        server: &str,
+        local: bool,
+        kind: StatusKind,
+        st: NetState,
+        agent_up: bool,
+    ) {
+        let mut do_connect = false;
+        let mut do_disconnect = false;
+        let mut copy_addr = false;
+        let mut copy_code = false;
+        let mut ask_remove = false;
+
+        ui.horizontal(|ui| {
+            // right-aligned actions first (reserved from the right edge),
+            // then the title group fills the remaining width, left-aligned.
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                // overflow / management actions
+                let ob = components::icon_button(ui, pal, Icon::Overflow, 34.0, true)
+                    .on_hover_text("More actions");
+                egui::Popup::from_toggle_button_response(&ob)
+                    .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                    .frame(
+                        egui::Frame::new()
+                            .fill(pal.surface_high)
+                            .corner_radius(R_MD)
+                            .inner_margin(egui::Margin::same(6)),
+                    )
+                    .show(|ui| {
+                        if ui.button("Copy address").clicked() {
+                            copy_addr = true;
+                        }
+                        if ui.button("Copy join code").clicked() {
+                            copy_code = true;
+                        }
+                        ui.separator();
+                        if ui
+                            .button(RichText::new("Remove network").color(pal.error.fg))
+                            .clicked()
+                        {
+                            ask_remove = true;
+                        }
+                    });
+
+                if agent_up {
+                    if components::button(
+                        ui,
+                        pal,
+                        BtnStyle::Tonal,
+                        Some(Icon::Power),
+                        "Disconnect",
+                        true,
+                    )
+                    .clicked()
+                    {
+                        do_disconnect = true;
+                    }
+                } else if components::button(
+                    ui,
+                    pal,
+                    BtnStyle::Filled,
+                    Some(Icon::Power),
+                    "Connect",
+                    true,
                 )
-                .fill(ACCENT);
-                if ui.add(b).clicked() {
-                    self.join_open = true;
+                .clicked()
+                {
+                    do_connect = true;
                 }
-                ui.add_space(6.0);
-                let b = egui::Button::new(RichText::new("Host a network").size(13.0));
-                if ui.add(b).clicked() {
+
+                // left side: title + status + host tag (truncates to fit)
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    ui.add(
+                        egui::Label::new(theme::page_title(name.to_string()).color(pal.on_surface))
+                            .truncate(),
+                    );
+                    ui.add_space(SP2);
+                    components::status_pill(ui, pal, kind, st.label());
+                    if local {
+                        components::neutral_tag(ui, pal, "Host");
+                    }
+                });
+            });
+        });
+        ui.add_space(2.0);
+        ui.horizontal(|ui| {
+            ui.label(theme::caption("coordinator").color(pal.on_surface_variant));
+            let addr = if server.is_empty() {
+                "starts with the network"
+            } else {
+                server
+            };
+            ui.label(theme::mono_small(addr).color(pal.on_surface_variant));
+        });
+
+        if copy_addr && !server.is_empty() {
+            ui.ctx().copy_text(server.to_string());
+            self.snack("Address copied to clipboard", SnackKind::Ok);
+        }
+        if copy_code {
+            let code = self.nets[i].cfg.code.clone();
+            ui.ctx().copy_text(code);
+            self.snack("Join code copied to clipboard", SnackKind::Ok);
+        }
+        if ask_remove {
+            self.remove_target = Some(i);
+        }
+        if do_connect {
+            self.connect(i);
+        }
+        if do_disconnect {
+            self.disconnect(i);
+        }
+    }
+
+    fn metrics_card(
+        &mut self,
+        ui: &mut Ui,
+        pal: &Palette,
+        kind: StatusKind,
+        st: NetState,
+        status: &Option<serde_json::Value>,
+    ) {
+        let (my_ip, peers, rx_now, tx_now, rx_total, tx_total) = stat_snapshot(status);
+        let has = status.is_some();
+        let mut copied_addr = false;
+
+        components::card(pal).show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = vec2(SP6, SP3);
+
+                // status
+                ui.vertical(|ui| {
+                    ui.label(theme::caption("Status").color(pal.on_surface_variant));
+                    components::status_pill(ui, pal, kind, st.label());
+                });
+
+                // virtual address
+                ui.vertical(|ui| {
+                    ui.label(theme::caption("Your address").color(pal.on_surface_variant));
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            theme::mono(if has { my_ip.clone() } else { "—".into() })
+                                .strong()
+                                .color(pal.on_surface),
+                        );
+                        if has
+                            && !my_ip.is_empty()
+                            && my_ip != "—"
+                            && components::copy_button(ui, pal, &my_ip)
+                        {
+                            copied_addr = true;
+                        }
+                    });
+                });
+
+                // peers
+                ui.vertical(|ui| {
+                    ui.label(theme::caption("Peers").color(pal.on_surface_variant));
+                    ui.label(
+                        theme::mono(if has {
+                            peers.len().to_string()
+                        } else {
+                            "—".into()
+                        })
+                        .strong()
+                        .color(if peers.is_empty() {
+                            pal.on_surface_variant
+                        } else {
+                            pal.on_surface
+                        }),
+                    );
+                });
+
+                // down
+                ui.vertical(|ui| {
+                    ui.label(theme::caption("Down").color(pal.on_surface_variant));
+                    ui.horizontal(|ui| {
+                        icons::show(ui, Icon::Download, 15.0, pal.series_down);
+                        ui.label(
+                            theme::mono(if has { fmt_bps(rx_now) } else { "—".into() })
+                                .strong()
+                                .color(pal.series_down),
+                        );
+                    });
+                });
+
+                // up
+                ui.vertical(|ui| {
+                    ui.label(theme::caption("Up").color(pal.on_surface_variant));
+                    ui.horizontal(|ui| {
+                        icons::show(ui, Icon::Upload, 15.0, pal.series_up);
+                        ui.label(
+                            theme::mono(if has { fmt_bps(tx_now) } else { "—".into() })
+                                .strong()
+                                .color(pal.series_up),
+                        );
+                    });
+                });
+            });
+            ui.add_space(SP1);
+            ui.label(
+                theme::caption(if has {
+                    format!(
+                        "Session traffic · {} down · {} up",
+                        fmt_bytes(rx_total),
+                        fmt_bytes(tx_total)
+                    )
+                } else {
+                    "Session traffic · no data yet".into()
+                })
+                .color(pal.on_surface_variant),
+            );
+        });
+
+        if copied_addr {
+            self.snack("Address copied to clipboard", SnackKind::Ok);
+        }
+    }
+
+    fn share_card(&mut self, ui: &mut Ui, pal: &Palette, i: usize) {
+        let server = self.nets[i].cfg.server.clone();
+        let code = self.nets[i].cfg.code.clone();
+        let port = server
+            .rsplit(':')
+            .next()
+            .and_then(|p| p.parse::<u16>().ok());
+        let lan = port.and_then(|p| self.lan_hint(p));
+        let addr = lan.clone().unwrap_or_else(|| server.clone());
+        let mut copied_a = false;
+        let mut copied_c = false;
+
+        components::card(pal).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                icons::show(ui, Icon::Server, 16.0, pal.primary);
+                ui.label(theme::section("Invite friends").color(pal.on_surface));
+            });
+            ui.add_space(2.0);
+            ui.label(
+                theme::label(
+                    "Share this address and join code — friends join from their GG LAN client.",
+                )
+                .color(pal.on_surface_variant),
+            );
+            ui.add_space(SP2);
+            if addr.is_empty() {
+                ui.label(
+                    theme::caption("The address appears once the network starts.")
+                        .color(pal.on_surface_variant),
+                );
+            } else {
+                share_row(ui, pal, "Address", &addr, &mut copied_a);
+                share_row(ui, pal, "Join code", &code, &mut copied_c);
+            }
+        });
+
+        if copied_a {
+            self.snack("Address copied to clipboard", SnackKind::Ok);
+        }
+        if copied_c {
+            self.snack("Join code copied to clipboard", SnackKind::Ok);
+        }
+    }
+
+    fn traffic_card(&mut self, ui: &mut Ui, pal: &Palette, status: &Option<serde_json::Value>) {
+        let (rx_series, tx_series) = series_snapshot(status);
+        let has = status.is_some();
+        let rx_now = *rx_series.last().unwrap_or(&0);
+        let tx_now = *tx_series.last().unwrap_or(&0);
+
+        components::card(pal).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(theme::section("Traffic").color(pal.on_surface));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(theme::caption("last 60 s").color(pal.on_surface_variant));
+                    legend_chip(ui, pal, "Up", fmt_bps(tx_now), pal.series_up, has);
+                    legend_chip(ui, pal, "Down", fmt_bps(rx_now), pal.series_down, has);
+                });
+            });
+            ui.add_space(SP2);
+            traffic_chart(ui, pal, &rx_series, &tx_series);
+        });
+    }
+
+    fn peers_card(
+        &mut self,
+        ui: &mut Ui,
+        pal: &Palette,
+        i: usize,
+        status: &Option<serde_json::Value>,
+        status_port: Option<u16>,
+    ) {
+        let peers = stat_snapshot(status).1;
+        let mut ping: Option<String> = None;
+        let mut copied_ip: Option<String> = None;
+        let show_traffic = ui.available_width() >= 620.0;
+
+        components::card(pal).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                icons::show(ui, Icon::Peers, 16.0, pal.on_surface_variant);
+                ui.label(theme::section("Peers").color(pal.on_surface));
+                ui.label(
+                    theme::caption(format!("{} online", peers.len())).color(pal.on_surface_variant),
+                );
+            });
+            ui.add_space(SP2);
+
+            if peers.is_empty() {
+                components::empty_state(
+                    ui,
+                    pal,
+                    Icon::Peers,
+                    "No peers connected",
+                    "Share the invite so friends can join this LAN.",
+                );
+                return;
+            }
+
+            let widths = PeerWidths::for_width(ui.available_width(), show_traffic);
+            peer_header(ui, pal, &widths);
+            for p in &peers {
+                let ping_res = self.pings.get(&(i, p.ip.clone())).cloned();
+                peer_row(
+                    ui,
+                    pal,
+                    p,
+                    ping_res,
+                    status_port,
+                    &widths,
+                    &mut ping,
+                    &mut copied_ip,
+                );
+            }
+        });
+
+        if let Some(ip) = ping {
+            self.pings.insert((i, ip.clone()), "…".into());
+            if let Some(port) = status_port {
+                fire_ping(i, port, ip, self.bus.tx.clone());
+            }
+        }
+        if let Some(ip) = copied_ip {
+            ui.ctx().copy_text(ip);
+            self.snack("Peer address copied", SnackKind::Ok);
+        }
+    }
+
+    fn log_section(&mut self, ui: &mut Ui, pal: &Palette, log: &[String]) {
+        ui.horizontal(|ui| {
+            icons::show(ui, Icon::Terminal, 15.0, pal.on_surface_variant);
+            egui::CollapsingHeader::new(
+                RichText::new("Event log")
+                    .size(14.0)
+                    .strong()
+                    .color(pal.on_surface),
+            )
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.add_space(SP1);
+                egui::ScrollArea::vertical()
+                    .max_height(220.0)
+                    .stick_to_bottom(true)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        for l in log.iter().rev() {
+                            ui.label(theme::mono_small(l.clone()).color(pal.on_surface_variant));
+                        }
+                    });
+            });
+        });
+    }
+
+    fn welcome(&mut self, ui: &mut Ui, pal: &Palette) {
+        ui.vertical_centered(|ui| {
+            ui.add_space(64.0);
+            let (rect, _) = ui.allocate_exact_size(vec2(76.0, 76.0), Sense::hover());
+            let p = ui.painter();
+            p.rect_filled(rect, CornerRadius::same(22), pal.primary_container);
+            icons::draw(p, Icon::Lan, rect.shrink(20.0), pal.on_primary_container);
+            ui.add_space(SP4);
+            ui.label(theme::page_title("GG LAN").color(pal.on_surface));
+            ui.add_space(SP1);
+            ui.label(
+                theme::body("A virtual LAN for your games — anywhere.")
+                    .color(pal.on_surface_variant),
+            );
+            ui.label(
+                theme::caption(
+                    "Encrypted peer-to-peer overlay with NAT traversal, for LAN parties over the internet.",
+                )
+                .color(pal.on_surface_variant),
+            );
+            ui.add_space(SP4);
+            ui.horizontal(|ui| {
+                if components::button(ui, pal, BtnStyle::Filled, Some(Icon::Server), "Host a network", true)
+                    .clicked()
+                {
                     self.create_open = true;
                 }
+                ui.add_space(SP2);
+                if components::button(ui, pal, BtnStyle::Outlined, Some(Icon::Globe), "Join a network", true)
+                    .clicked()
+                {
+                    self.join_open = true;
+                }
             });
-            ui.add_space(30.0);
+            ui.add_space(SP6);
             ui.label(
-                RichText::new(format!(
-                    "nickname \u{201c}{}\u{201d} · config {}",
+                theme::caption(format!(
+                    "Nickname \u{201c}{}\u{201d} · GG LAN v{}",
                     self.cfg.nickname,
-                    self.cfg_dir.display()
+                    env!("CARGO_PKG_VERSION")
                 ))
-                .size(10.5)
-                .color(MUTED),
+                .color(pal.outline),
             );
         });
     }
 
     // ------------------------------------------------------------ dialogs
 
-    fn dialogs(&mut self, ctx: &egui::Context) {
+    fn dialogs(&mut self, ctx: &egui::Context, pal: &Palette) {
         // ---- join
         let mut join_open = self.join_open;
-        egui::Window::new("Join a network")
-            .open(&mut join_open)
-            .resizable(false)
-            .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
-            .show(ctx, |ui| {
-                self.join_body(ui);
+        if join_open {
+            let closed = modal_frame(ctx, pal, "Join a network", 450.0, |ui, pal| {
+                self.join_body(ui, pal)
             });
+            if closed {
+                self.dlg_close = true;
+            }
+        }
         if self.dlg_close {
-            join_open = false;
             self.dlg_close = false;
+            join_open = false;
         }
         self.join_open = join_open;
 
         // ---- create / host
         let mut create_open = self.create_open;
-        egui::Window::new("Host a network")
-            .open(&mut create_open)
-            .resizable(false)
-            .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
-            .show(ctx, |ui| {
-                self.create_body(ui);
+        if create_open {
+            let closed = modal_frame(ctx, pal, "Host a network", 460.0, |ui, pal| {
+                self.host_body(ui, pal)
             });
+            if closed {
+                self.dlg_close = true;
+            }
+        }
         if self.dlg_close {
-            create_open = false;
             self.dlg_close = false;
+            create_open = false;
         }
         self.create_open = create_open;
 
         // ---- settings
         let mut settings_open = self.settings_open;
-        egui::Window::new("Settings")
-            .open(&mut settings_open)
-            .resizable(false)
-            .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
-            .show(ctx, |ui| {
-                self.settings_body(ui);
+        if settings_open {
+            let closed = modal_frame(ctx, pal, "Settings", 540.0, |ui, pal| {
+                self.settings_body(ui, pal)
             });
+            if closed {
+                self.dlg_close = true;
+            }
+        }
         if self.dlg_close {
-            settings_open = false;
             self.dlg_close = false;
+            settings_open = false;
+            // dismissed without saving -> revert any in-dialog edits
+            if let Some(b) = self.settings_backup.take() {
+                self.cfg = b;
+            }
         }
         self.settings_open = settings_open;
+
+        // ---- remove confirmation
+        if let Some(i) = self.remove_target {
+            let name = self
+                .nets
+                .get(i)
+                .map(|n| n.cfg.name.clone())
+                .unwrap_or_default();
+            let mut do_remove = false;
+            let closed = modal_frame(ctx, pal, "Remove network?", 440.0, |ui, pal| {
+                ui.label(
+                    theme::label(format!(
+                        "This disconnects and forgets \u{201c}{name}\u{201d}. You will need its address and join code to join it again."
+                    ))
+                    .color(pal.on_surface_variant),
+                );
+                ui.add_space(SP4);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if components::destructive(ui, pal, "Remove network").clicked() {
+                        do_remove = true;
+                    }
+                    if components::button(ui, pal, BtnStyle::Text, None, "Cancel", true).clicked() {
+                        self.dlg_close = true;
+                    }
+                });
+            });
+            if closed {
+                self.dlg_close = true;
+            }
+            if self.dlg_close {
+                self.dlg_close = false;
+                self.remove_target = None;
+            }
+            if do_remove {
+                self.remove_net(i);
+                self.snack("Network removed", SnackKind::Ok);
+            }
+        }
+
+        // Enter submits the join form while it is open.
+        if self.join_open {
+            let enter = ctx.input(|i| i.key_pressed(egui::Key::Enter));
+            if enter {
+                self.join_submit();
+            }
+        }
     }
 
-    fn join_body(&mut self, ui: &mut Ui) {
-        ui.set_min_width(380.0);
+    fn join_body(&mut self, ui: &mut Ui, pal: &Palette) {
         ui.label(
-            RichText::new("Ask the host for their address and join code.")
-                .size(12.0)
-                .color(MUTED),
+            theme::label("Ask the host for their address and join code.")
+                .color(pal.on_surface_variant),
         );
-        ui.add_space(8.0);
-        field(
+        ui.add_space(SP3);
+
+        // clear field errors as the user types
+        if !self.join_server.trim().is_empty() {
+            self.join_server_error = None;
+        }
+        if !self.join_code.trim().is_empty() {
+            self.join_code_error = None;
+        }
+
+        components::field(
             ui,
+            pal,
             "Network name",
             &mut self.join_name,
             "e.g. Friday Night Games",
+            None,
         );
-        field(
+        ui.add_space(SP2);
+        components::field(
             ui,
+            pal,
             "Server address",
             &mut self.join_server,
-            "host or ip:port (default :7100)",
+            "host or ip:port — default port :7100",
+            self.join_server_error.as_deref(),
         );
-        field(
+        ui.add_space(SP2);
+        components::field(
             ui,
+            pal,
             "Join code",
             &mut self.join_code,
             "the code the host shared with you",
+            self.join_code_error.as_deref(),
         );
-        ui.add_space(4.0);
-        ui.checkbox(&mut self.join_now, "Connect immediately");
-        ui.add_space(10.0);
+        ui.add_space(SP3);
+        ui.add(egui::Checkbox::new(
+            &mut self.join_now,
+            RichText::new("Connect immediately").color(pal.on_surface_variant),
+        ));
+        ui.add_space(SP4);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui
-                .add(
-                    egui::Button::new(
-                        RichText::new("Join network")
-                            .size(12.5)
-                            .color(Color32::WHITE),
-                    )
-                    .fill(ACCENT),
-                )
-                .clicked()
-            {
+            if components::button(ui, pal, BtnStyle::Filled, None, "Join network", true).clicked() {
                 self.join_submit();
             }
-            if ui.button(RichText::new("Cancel").size(12.5)).clicked() {
+            if components::button(ui, pal, BtnStyle::Text, None, "Cancel", true).clicked() {
                 self.dlg_close = true;
             }
         });
@@ -810,8 +1217,18 @@ impl GgApp {
         if !server.is_empty() && !server.contains(':') {
             server = format!("{server}:7100");
         }
-        if server.is_empty() || code.is_empty() {
-            self.toast("Server address and join code are required", false);
+        // inline validation — keep the dialog open until the form is valid
+        self.join_server_error = if server.is_empty() {
+            Some("Enter the host's address, e.g. 203.0.113.7:7100".into())
+        } else {
+            None
+        };
+        self.join_code_error = if code.is_empty() {
+            Some("Enter the join code the host shared with you".into())
+        } else {
+            None
+        };
+        if self.join_server_error.is_some() || self.join_code_error.is_some() {
             return;
         }
         let cfg = NetCfg {
@@ -828,72 +1245,85 @@ impl GgApp {
         self.selected = Some(idx);
         self.save();
         self.dlg_close = true;
+        let joined_name = self.nets[idx].cfg.name.clone();
         self.join_name.clear();
         self.join_server.clear();
         self.join_code.clear();
         if self.join_now {
             self.connect(idx);
+            self.snack(
+                format!("Joining \u{201c}{joined_name}\u{201d}…"),
+                SnackKind::Ok,
+            );
+        } else {
+            self.snack(
+                format!("Network \u{201c}{joined_name}\u{201d} added"),
+                SnackKind::Ok,
+            );
         }
-        self.toast("Network added", true);
     }
 
-    fn create_body(&mut self, ui: &mut Ui) {
-        ui.set_min_width(420.0);
+    fn host_body(&mut self, ui: &mut Ui, pal: &Palette) {
         ui.label(
-            RichText::new("Host a coordinator on this machine and share the code with friends.")
-                .size(12.0)
-                .color(MUTED),
+            theme::label("Run a coordinator on this machine and invite your friends.")
+                .color(pal.on_surface_variant),
         );
-        ui.add_space(8.0);
-        field(
+        ui.add_space(SP3);
+        components::field(
             ui,
+            pal,
             "Network name",
             &mut self.create_name,
-            "e.g. CS2 Lan Party",
+            "e.g. CS2 LAN Party",
+            None,
         );
-        ui.label(RichText::new("Mode").size(11.5).color(MUTED));
-        egui::ComboBox::from_id_salt("create_mode")
-            .selected_text(if self.create_mode == "hub" {
-                "Hub — all traffic relayed through the host"
+        ui.add_space(SP3);
+        ui.label(theme::label("Mode").color(pal.on_surface_variant));
+        let mode_ptr: &'static str = self.create_mode;
+        let mut mode = mode_ptr;
+        components::segmented(
+            ui,
+            pal,
+            "host_mode",
+            &[(&"mesh", "Mesh"), (&"hub", "Hub")],
+            &mut mode,
+        );
+        self.create_mode = mode;
+        ui.add_space(SP2);
+        ui.label(
+            theme::caption(if mode == "hub" {
+                "All traffic is relayed through this machine — works when direct connections are blocked. Traffic stays end-to-end encrypted."
             } else {
-                "Mesh — direct peer-to-peer when possible"
+                "Peers connect directly to each other when possible, with encrypted relay fallback. Best performance for games."
             })
-            .show_ui(ui, |ui| {
-                ui.selectable_value(
-                    &mut self.create_mode,
-                    "mesh".into(),
-                    "Mesh — direct peer-to-peer when possible",
-                );
-                ui.selectable_value(
-                    &mut self.create_mode,
-                    "hub".into(),
-                    "Hub — all traffic relayed through the host",
-                );
-            });
-        ui.add_space(4.0);
-        ui.checkbox(&mut self.create_now, "Start hosting now");
-        ui.add_space(10.0);
+            .color(pal.on_surface_variant),
+        );
+        ui.add_space(SP3);
+        ui.add(egui::Checkbox::new(
+            &mut self.create_now,
+            RichText::new("Start hosting now").color(pal.on_surface_variant),
+        ));
+        ui.add_space(SP4);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui
-                .add(
-                    egui::Button::new(
-                        RichText::new("Create network")
-                            .size(12.5)
-                            .color(Color32::WHITE),
-                    )
-                    .fill(ACCENT),
-                )
-                .clicked()
+            if components::button(
+                ui,
+                pal,
+                BtnStyle::Filled,
+                Some(Icon::Server),
+                "Create network",
+                true,
+            )
+            .clicked()
             {
-                self.create_submit();
+                self.host_submit();
             }
-            if ui.button(RichText::new("Cancel").size(12.5)).clicked() {
+            if components::button(ui, pal, BtnStyle::Text, None, "Cancel", true).clicked() {
                 self.dlg_close = true;
             }
         });
     }
 
-    fn create_submit(&mut self) {
+    fn host_submit(&mut self) {
         let mut name = self.create_name.trim().to_string();
         if name.is_empty() {
             name = "my lan".into();
@@ -927,120 +1357,134 @@ impl GgApp {
                 .next()
                 .and_then(|p| p.parse::<u16>().ok());
             let code = self.nets[idx].cfg.code.clone();
-            if let Some(port) = port {
-                if let Some(addr) = lan_address(port) {
-                    self.toast(
-                        format!(
-                            "Hosting \u{201c}{name}\u{201d} — friends join {addr} with code {code}"
-                        ),
-                        true,
-                    );
-                } else {
-                    self.toast(
-                        format!("Hosting \u{201c}{name}\u{201d} — code {code}"),
-                        true,
-                    );
-                }
-            } else {
-                self.toast(format!("Hosting \u{201c}{name}\u{201d}"), true);
+            match port.and_then(|p| self.lan_hint(p)) {
+                Some(addr) => self.snack(
+                    format!(
+                        "Hosting \u{201c}{name}\u{201d} — friends join {addr} with code {code}"
+                    ),
+                    SnackKind::Ok,
+                ),
+                None => self.snack(
+                    format!("Hosting \u{201c}{name}\u{201d} — code {code}"),
+                    SnackKind::Ok,
+                ),
             }
         } else {
-            self.toast(
+            self.snack(
                 format!("Network \u{201c}{name}\u{201d} created (not started)"),
-                true,
+                SnackKind::Ok,
             );
         }
     }
 
-    fn settings_body(&mut self, ui: &mut Ui) {
-        ui.set_min_width(420.0);
-        ui.label(
-            RichText::new("How this machine appears to peers.")
-                .size(12.0)
-                .color(MUTED),
-        );
-        field(
+    fn settings_body(&mut self, ui: &mut Ui, pal: &Palette) {
+        // ---- appearance
+        ui.label(theme::label("Appearance").strong().color(pal.on_surface));
+        ui.add_space(SP1);
+        let mut pref = theme::ThemePrefs::parse(&self.cfg.theme);
+        components::segmented(
             ui,
+            pal,
+            "theme_pref",
+            &[
+                (&theme::ThemePrefs::System, "System"),
+                (&theme::ThemePrefs::Light, "Light"),
+                (&theme::ThemePrefs::Dark, "Dark"),
+            ],
+            &mut pref,
+        );
+        self.cfg.theme = pref.as_str().into();
+        ui.add_space(2.0);
+        ui.label(
+            theme::caption("System follows your operating system's dark mode.")
+                .color(pal.on_surface_variant),
+        );
+        ui.add_space(SP3);
+        components::hairline(ui, pal);
+        ui.add_space(SP3);
+
+        // ---- identity
+        ui.label(theme::label("Identity").strong().color(pal.on_surface));
+        ui.add_space(SP1);
+        components::field(
+            ui,
+            pal,
             "Nickname",
             &mut self.cfg.nickname,
             "shown to other players",
+            None,
         );
-        ui.add_space(6.0);
-        field(
+        ui.add_space(SP3);
+        components::hairline(ui, pal);
+        ui.add_space(SP3);
+
+        // ---- runtime
+        ui.label(theme::label("Runtime").strong().color(pal.on_surface));
+        ui.add_space(SP1);
+        components::field(
             ui,
+            pal,
             "Agent binary",
             &mut self.cfg.agent_path,
             "blank = auto-detect (next to GG LAN)",
+            None,
         );
-        field(
+        ui.add_space(SP2);
+        components::field(
             ui,
+            pal,
             "Coordinator binary",
             &mut self.cfg.server_path,
             "blank = auto-detect (next to GG LAN)",
+            None,
         );
-        ui.add_space(6.0);
+        ui.add_space(SP3);
+        components::hairline(ui, pal);
+        ui.add_space(SP3);
+
+        // ---- configuration & diagnostics (read-only)
+        ui.label(theme::label("Configuration").strong().color(pal.on_surface));
+        ui.add_space(SP1);
+        let mut copied = false;
+        path_row(ui, pal, "Config file", &self.cfg_path, &mut copied);
+        path_row(ui, pal, "Identity file", &self.identity, &mut copied);
+        ui.add_space(SP1);
         ui.label(
-            RichText::new(format!("config: {}", self.cfg_path.display()))
-                .size(10.5)
-                .color(MUTED),
+            theme::caption(format!(
+                "GG LAN v{} · your node identity never leaves this machine",
+                env!("CARGO_PKG_VERSION")
+            ))
+            .color(pal.on_surface_variant),
         );
-        ui.label(
-            RichText::new(format!("identity: {}", self.identity.display()))
-                .size(10.5)
-                .color(MUTED),
-        );
-        ui.add_space(10.0);
+        ui.add_space(SP4);
+
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui
-                .add(
-                    egui::Button::new(RichText::new("Save").size(12.5).color(Color32::WHITE))
-                        .fill(ACCENT),
-                )
-                .clicked()
-            {
+            if components::button(ui, pal, BtnStyle::Filled, None, "Save", true).clicked() {
                 self.save();
                 self.dlg_close = true;
             }
-            if ui.button(RichText::new("Cancel").size(12.5)).clicked() {
+            if components::button(ui, pal, BtnStyle::Text, None, "Cancel", true).clicked() {
+                if let Some(b) = self.settings_backup.take() {
+                    self.cfg = b;
+                }
                 self.dlg_close = true;
             }
         });
+        if copied {
+            self.snack("Path copied to clipboard", SnackKind::Ok);
+        }
     }
 
-    // ------------------------------------------------------------ toast
+    // ------------------------------------------------------------ helpers
 
-    fn draw_toast(&mut self, ctx: &egui::Context) {
-        let Some((text, at, ok)) = self.toast.clone() else {
-            return;
-        };
-        let age = at.elapsed().as_secs_f32();
-        if age > 4.0 {
-            self.toast = None;
-            return;
+    /// Compute (and cache) this machine's LAN address for a coordinator port.
+    fn lan_hint(&mut self, port: u16) -> Option<String> {
+        if let Some(h) = self.lan_hints.get(&port) {
+            return Some(h.clone());
         }
-        let fade = if age > 3.0 { 1.0 - (age - 3.0) } else { 1.0 };
-        let alpha = (fade * 235.0) as u8;
-        let color = if ok { GOOD } else { BAD };
-        let bg = Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), alpha);
-        egui::Area::new(egui::Id::new("gg_toast"))
-            .anchor(Align2::CENTER_BOTTOM, [0.0, -28.0])
-            .order(egui::Order::Foreground)
-            .interactable(false)
-            .show(ctx, |ui| {
-                egui::Frame::group(ui.style())
-                    .fill(bg)
-                    .stroke(Stroke::NONE)
-                    .corner_radius(8)
-                    .inner_margin(egui::Margin::symmetric(14, 8))
-                    .show(ui, |ui| {
-                        ui.label(
-                            RichText::new(text)
-                                .size(12.5)
-                                .strong()
-                                .color(Color32::WHITE),
-                        );
-                    });
-            });
+        let hint = lan_address(port)?;
+        self.lan_hints.insert(port, hint.clone());
+        Some(hint)
     }
 }
 
@@ -1050,47 +1494,388 @@ impl Drop for GgApp {
     }
 }
 
-// ---------------------------------------------------------------- helpers
+// ---------------------------------------------------------------- free helpers
 
-fn field(ui: &mut Ui, label: &str, value: &mut String, hint: &str) {
-    ui.label(RichText::new(label).size(11.5).color(MUTED));
-    ui.add(
-        egui::TextEdit::singleline(value)
-            .hint_text(hint)
-            .desired_width(f32::INFINITY),
-    );
-    ui.add_space(4.0);
+fn modal_frame(
+    ctx: &egui::Context,
+    pal: &Palette,
+    title: &str,
+    width: f32,
+    body: impl FnOnce(&mut Ui, &Palette),
+) -> bool {
+    let mut close = false;
+    egui::Window::new(title)
+        .title_bar(false)
+        .resizable(false)
+        .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+        .frame(
+            egui::Frame::new()
+                .fill(pal.dialog)
+                .corner_radius(R_XL)
+                .inner_margin(egui::Margin::same(24)),
+        )
+        .show(ctx, |ui| {
+            ui.set_min_width(width);
+            ui.horizontal(|ui| {
+                ui.label(theme::section(title).color(pal.on_surface));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let cb = components::icon_button(ui, pal, Icon::Close, 28.0, true);
+                    if cb.clicked() {
+                        close = true;
+                    }
+                    cb.on_hover_text("Close");
+                });
+            });
+            ui.add_space(SP3);
+            body(ui, pal);
+        });
+    close
 }
 
-fn state_colors(st: NetState) -> (Color32, Color32) {
+fn kind_of(st: NetState) -> StatusKind {
     match st {
-        NetState::Connected => (GOOD, GOOD_SOFT),
-        NetState::Waiting | NetState::Starting => (WARN, WARN_SOFT),
-        NetState::Dead => (BAD, BAD_SOFT),
-        NetState::Off => (IDLE, IDLE_SOFT),
+        NetState::Connected => StatusKind::Connected,
+        NetState::Starting => StatusKind::Connecting,
+        NetState::Waiting => StatusKind::Waiting,
+        NetState::Off => StatusKind::Offline,
+        NetState::Dead => StatusKind::Error,
     }
 }
 
-fn path_colors(path: &str) -> (Color32, Color32) {
-    match path {
-        "direct" => (GOOD, GOOD_SOFT),
-        "relay" => (WARN, WARN_SOFT),
-        _ => (IDLE, IDLE_SOFT),
+fn share_row(ui: &mut Ui, pal: &Palette, label: &str, value: &str, copied: &mut bool) {
+    ui.horizontal(|ui| {
+        ui.add(egui::Label::new(theme::label(label).color(pal.on_surface_variant)).truncate());
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if components::copy_button(ui, pal, value) {
+                *copied = true;
+            }
+            ui.add_space(SP1);
+            ui.label(theme::mono(value.to_string()).color(pal.on_surface));
+        });
+    });
+}
+
+fn path_row(ui: &mut Ui, pal: &Palette, label: &str, path: &std::path::Path, copied: &mut bool) {
+    ui.horizontal(|ui| {
+        ui.label(theme::caption(label).color(pal.on_surface_variant));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if components::copy_button(ui, pal, &path.display().to_string()) {
+                *copied = true;
+            }
+            ui.add_space(SP1);
+            ui.add(
+                egui::Label::new(
+                    theme::mono_small(path.display().to_string()).color(pal.on_surface_variant),
+                )
+                .truncate(),
+            );
+        });
+    });
+}
+
+fn legend_chip(ui: &mut Ui, pal: &Palette, label: &str, value: String, color: Color32, has: bool) {
+    ui.horizontal(|ui| {
+        let (r, _) = ui.allocate_exact_size(vec2(9.0, 9.0), Sense::hover());
+        ui.painter().circle_filled(r.center(), 3.5, color);
+        ui.label(
+            theme::caption(format!("{label} {}", if has { value } else { "—".into() }))
+                .color(pal.on_surface_variant),
+        );
+    });
+}
+
+struct PeerWidths {
+    name: f32,
+    ip: f32,
+    path: f32,
+    rtt: f32,
+    traffic: f32,
+    ping: f32,
+    show_traffic: bool,
+}
+
+impl PeerWidths {
+    /// Column layout adapts to the available width: the secondary traffic
+    /// column drops first, then columns compact — essential peer info
+    /// (name, address, path, rtt, ping) always stays reachable.
+    fn for_width(avail: f32, show_traffic: bool) -> Self {
+        let wide = avail >= 520.0;
+        let ip = if wide { 104.0 } else { 88.0 };
+        let path = 66.0;
+        let rtt = 52.0;
+        let traffic = if show_traffic { 88.0 } else { 0.0 };
+        let ping = if wide { 168.0 } else { 112.0 };
+        let used = ip + path + rtt + traffic + ping + 5.0 * SP3;
+        let name = (avail - used).max(72.0);
+        Self {
+            name,
+            ip,
+            path,
+            rtt,
+            traffic,
+            ping,
+            show_traffic,
+        }
     }
 }
 
-fn header_frame() -> egui::Frame {
-    egui::Frame::new()
-        .fill(CARD)
-        .stroke(Stroke::new(1.0, HAIRLINE))
+fn peer_header(ui: &mut Ui, pal: &Palette, w: &PeerWidths) {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = SP3;
+        let c = pal.on_surface_variant;
+        ui.add_sized(
+            [w.name, 16.0],
+            egui::Label::new(theme::caption("Name").color(c)),
+        );
+        ui.add_sized(
+            [w.ip, 16.0],
+            egui::Label::new(theme::caption("Address").color(c)),
+        );
+        ui.add_sized(
+            [w.path, 16.0],
+            egui::Label::new(theme::caption("Path").color(c)),
+        );
+        ui.add_sized(
+            [w.rtt, 16.0],
+            egui::Label::new(theme::caption("RTT").color(c)).halign(egui::Align::Max),
+        );
+        if w.show_traffic {
+            ui.add_sized(
+                [w.traffic, 16.0],
+                egui::Label::new(theme::caption("Traffic").color(c)).halign(egui::Align::Max),
+            );
+        }
+        ui.add_sized(
+            [w.ping, 16.0],
+            egui::Label::new(theme::caption("").color(c)),
+        );
+    });
+    ui.add_space(SP1);
+    components::hairline(ui, pal);
 }
 
-fn panel_frame() -> egui::Frame {
-    egui::Frame::new()
-        .fill(PAGE)
-        .inner_margin(egui::Margin::same(16))
-        .stroke(Stroke::NONE)
+#[allow(clippy::too_many_arguments)]
+fn peer_row(
+    ui: &mut Ui,
+    pal: &Palette,
+    p: &PeerView,
+    ping_res: Option<String>,
+    status_port: Option<u16>,
+    w: &PeerWidths,
+    ping: &mut Option<String>,
+    copied_ip: &mut Option<String>,
+) {
+    let row_h = 36.0;
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = SP3;
+        // name
+        ui.add_sized(
+            [w.name, row_h],
+            egui::Label::new(
+                RichText::new(p.name.clone())
+                    .size(13.0)
+                    .strong()
+                    .color(pal.on_surface),
+            )
+            .truncate(),
+        );
+        // address (click to copy)
+        let ip_label =
+            egui::Label::new(theme::mono_small(p.ip.clone()).color(pal.on_surface_variant))
+                .sense(Sense::click());
+        let ipr = ui.add_sized([w.ip, row_h], ip_label);
+        if ipr.clicked() {
+            *copied_ip = Some(p.ip.clone());
+        }
+        ipr.on_hover_cursor(egui::CursorIcon::Copy)
+            .on_hover_text("Click to copy");
+        // path
+        let (pc, tag_label) = match p.path.as_str() {
+            "direct" => (pal.success, "direct"),
+            "relay" => (pal.warn, "relay"),
+            _ => (pal.off, p.path.as_str()),
+        };
+        components::tag(ui, &pc, tag_label);
+        // rtt
+        ui.add_sized(
+            [w.rtt, row_h],
+            egui::Label::new(
+                theme::mono_small(
+                    p.rtt
+                        .map(|r| format!("{r} ms"))
+                        .unwrap_or_else(|| "—".into()),
+                )
+                .color(if p.rtt.is_some() {
+                    pal.on_surface
+                } else {
+                    pal.outline
+                }),
+            )
+            .halign(egui::Align::Max),
+        );
+        // traffic
+        if w.show_traffic {
+            ui.add_sized(
+                [w.traffic, row_h],
+                egui::Label::new(
+                    theme::mono_small(fmt_bytes(p.bytes_in + p.bytes_out))
+                        .color(pal.on_surface_variant),
+                )
+                .halign(egui::Align::Max),
+            );
+        }
+        // ping
+        ui.add_sized([w.ping, row_h], |ui: &mut Ui| {
+            ui.horizontal(|ui| {
+                match &ping_res {
+                    Some(res) if res == "…" => {
+                        ui.add(egui::Spinner::new().size(13.0));
+                    }
+                    Some(res) => {
+                        let color = if res.starts_with("failed") || res.starts_with("error") {
+                            pal.error.fg
+                        } else if res.ends_with(" ms") {
+                            pal.success.fg
+                        } else {
+                            pal.on_surface_variant
+                        };
+                        ui.add(
+                            egui::Label::new(theme::mono_small(res.clone()).color(color))
+                                .truncate(),
+                        );
+                    }
+                    None => {}
+                }
+                if status_port.is_some() {
+                    if components::button_small(ui, pal, BtnStyle::Outlined, None, "Ping", true)
+                        .clicked()
+                    {
+                        *ping = Some(p.ip.clone());
+                    }
+                } else {
+                    ui.label(theme::caption("offline").color(pal.outline));
+                }
+            });
+            ui.response()
+        });
+    });
+    components::hairline(ui, pal);
 }
+
+// ---------------------------------------------------------------- traffic chart
+
+fn traffic_chart(ui: &mut Ui, pal: &Palette, rx: &[u64], tx: &[u64]) {
+    let h = 138.0;
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), h), Sense::hover());
+    let p = ui.painter();
+    let plot = Rect::from_min_max(
+        Pos2::new(rect.left(), rect.top()),
+        Pos2::new(rect.right() - 56.0, rect.bottom() - 15.0),
+    );
+    if plot.width() < 60.0 || plot.height() < 40.0 {
+        return;
+    }
+
+    let empty = rx.is_empty() && tx.is_empty();
+    let max = rx
+        .iter()
+        .chain(tx.iter())
+        .copied()
+        .max()
+        .unwrap_or(1)
+        .max(1) as f32
+        * 1.25;
+
+    // subtle horizontal grid + right-side axis labels
+    for i in 0..=3 {
+        let y = plot.bottom() - plot.height() * i as f32 / 3.0;
+        p.line_segment(
+            [Pos2::new(plot.left(), y), Pos2::new(plot.right(), y)],
+            Stroke::new(1.0, pal.outline_variant),
+        );
+        let label = if i == 0 {
+            "0".to_string()
+        } else {
+            fmt_bps((max * i as f32 / 3.0) as u64)
+        };
+        let g = p.layout_job(egui::text::LayoutJob::simple(
+            label,
+            egui::FontId::monospace(10.0),
+            pal.on_surface_variant,
+            f32::INFINITY,
+        ));
+        p.galley(
+            Pos2::new(rect.right() - g.size().x, y - g.size().y / 2.0),
+            g,
+            pal.on_surface_variant,
+        );
+    }
+    // x labels
+    for (x, t) in [(plot.left(), "-60 s"), (plot.right(), "now")] {
+        let g = p.layout_job(egui::text::LayoutJob::simple(
+            t.to_string(),
+            egui::FontId::monospace(10.0),
+            pal.on_surface_variant,
+            f32::INFINITY,
+        ));
+        p.galley(
+            Pos2::new(
+                (x - g.size().x / 2.0).clamp(plot.left(), plot.right() - g.size().x),
+                plot.bottom() + 4.0,
+            ),
+            g,
+            pal.on_surface_variant,
+        );
+    }
+
+    if empty {
+        let g = p.layout_job(egui::text::LayoutJob::simple(
+            "Waiting for traffic data…".into(),
+            egui::FontId::proportional(12.5),
+            pal.on_surface_variant,
+            f32::INFINITY,
+        ));
+        p.galley(
+            Pos2::new(
+                plot.center().x - g.size().x / 2.0,
+                plot.center().y - g.size().y / 2.0,
+            ),
+            g,
+            pal.on_surface_variant,
+        );
+        return;
+    }
+
+    for (series, color) in [(rx, pal.series_down), (tx, pal.series_up)] {
+        let n = series.len();
+        if n == 0 {
+            continue;
+        }
+        let step = plot.width() / 59.0;
+        let pts: Vec<Pos2> = series
+            .iter()
+            .enumerate()
+            .map(|(i, v)| {
+                let x = plot.right() - (n - 1 - i) as f32 * step;
+                let y = plot.bottom() - (*v as f32 / max) * plot.height();
+                Pos2::new(x, y)
+            })
+            .collect();
+        // area fill (convex enough: series + baseline)
+        let mut area = pts.clone();
+        area.push(Pos2::new(plot.right(), plot.bottom()));
+        area.push(Pos2::new(pts[0].x, plot.bottom()));
+        p.add(egui::Shape::Path(egui::epaint::PathShape {
+            points: area,
+            closed: true,
+            fill: pal.area_fill(color),
+            stroke: Stroke::NONE.into(),
+        }));
+        p.add(egui::Shape::line(pts, Stroke::new(1.8, color)));
+    }
+}
+
+// ---------------------------------------------------------------- snapshots
 
 struct PeerView {
     name: String,
@@ -1160,12 +1945,4 @@ fn series_snapshot(status: &Option<serde_json::Value>) -> (Vec<u64>, Vec<u64>) {
         }
     }
     (rx, tx)
-}
-
-fn stat_card(ui: &mut Ui, label: &str, value: String, color: Color32) {
-    card_frame(ui).show(ui, |ui| {
-        ui.set_min_width(108.0);
-        ui.label(RichText::new(label).size(9.5).strong().color(MUTED));
-        ui.label(RichText::new(value).size(15.0).strong().color(color));
-    });
 }

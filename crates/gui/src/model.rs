@@ -33,7 +33,7 @@ pub struct NetCfg {
     pub enabled: bool,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 #[serde(default)]
 pub struct GuiConfig {
     pub nickname: String,
@@ -41,6 +41,8 @@ pub struct GuiConfig {
     pub agent_path: String,
     /// Optional explicit coordinator binary path (blank = auto-detect).
     pub server_path: String,
+    /// Theme preference: "system" | "light" | "dark".
+    pub theme: String,
     pub networks: Vec<NetCfg>,
 }
 
@@ -50,6 +52,7 @@ impl Default for GuiConfig {
             nickname: default_nickname(),
             agent_path: String::new(),
             server_path: String::new(),
+            theme: "system".into(),
             networks: Vec::new(),
         }
     }

@@ -11,7 +11,9 @@ path = "src/main.rs"
 
 [dependencies]
 gg-lan-core = { workspace = true }
-eframe = "0.36"
+# "glow" is an OpenGL fallback renderer (kept for GPU-less machines, VMs and
+# headless testing); wgpu remains the default.
+eframe = { version = "0.36", features = ["glow"] }
 egui = "0.36"
 serde = { workspace = true }
 serde_json = { workspace = true }

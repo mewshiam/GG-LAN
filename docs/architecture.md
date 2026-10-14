@@ -59,7 +59,7 @@ gg-lan (Rust workspace)
 Operator companion for a running agent: `gg-lan-cli status [--agent 127.0.0.1:7800]`, `peers` (compact table), `ping <ip>` (agent-side synthetic ARP+ICMP probe).
 
 ### 2.5 gg-lan-gui (native desktop client)
-Single-binary native app (eframe/egui, no Electron). Radmin VPN-style UI: networks sidebar with per-network power switches, peer table (path/RTT badges, per-peer ping), live traffic charts, stat cards, event log. Manages one `gg-lan-agent` child process per joined network and can host a local `gg-lan-server` coordinator ("Host a network"). Talks to agents over their localhost `/status` HTTP API; persists `gui.json` under the platform config dir.
+Single-binary native app (eframe/egui, no Electron), styled after Material 3: semantic color tokens with full light/dark palettes plus a system-following theme preference (persisted in `gui.json`), a reusable component layer (buttons, pills, switches, cards, fields, snackbars) and a vector icon set drawn directly on the egui painter — no extra assets or dependencies. Screens: networks sidebar with per-network power switches, dashboard (status, virtual IP, live up/down chart), peer table (path/RTT badges, per-peer ping, copy-address), collapsible event log. Manages one `gg-lan-agent` child process per joined network and can host a local `gg-lan-server` coordinator ("Host a network"). Talks to agents over their localhost `/status` HTTP API; persists `gui.json` under the platform config dir.
 
 ## 3. Security model
 

@@ -73,6 +73,7 @@ code is verified before any key material is exchanged.
 | **Peers** | name, IP, `direct`/`relay` path badge, RTT, per-peer traffic, one-click ping |
 | **Host a network** | spins up a local coordinator and joins it automatically |
 | **Event log** | agent/coordinator stderr for quick diagnosis |
+| **Themes** | Material 3-inspired UI with system / light / dark modes (Settings) |
 
 Configuration lives in the platform config dir (`~/.config/gg-lan/` on Linux,
 `%APPDATA%\gg-lan\` on Windows, `~/Library/Application Support/gg-lan/` on

@@ -1043,6 +1043,7 @@ dependencies = [
  "egui-wgpu",
  "egui-winit",
  "egui_glow",
+ "glow",
  "glutin",
  "glutin-winit",
  "image",
@@ -1477,7 +1478,7 @@ dependencies = [
 
 [[package]]
 name = "gg-lan-agent"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "base64",
@@ -1492,7 +1493,7 @@ dependencies = [
 
 [[package]]
 name = "gg-lan-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -1501,7 +1502,7 @@ dependencies = [
 
 [[package]]
 name = "gg-lan-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "base64",
@@ -1519,7 +1520,7 @@ dependencies = [
 
 [[package]]
 name = "gg-lan-e2e"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "serde_json",
@@ -1527,7 +1528,7 @@ dependencies = [
 
 [[package]]
 name = "gg-lan-gui"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "dirs",
@@ -1541,7 +1542,7 @@ dependencies = [
 
 [[package]]
 name = "gg-lan-server"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "base64",
