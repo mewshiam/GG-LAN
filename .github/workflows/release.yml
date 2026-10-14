@@ -82,7 +82,9 @@ jobs:
           - os: macos-latest
             target: aarch64-apple-darwin
             archive: tar.gz
-          - os: macos-13
+          # macos-13 (Intel) runners are retired - cross-compile x86_64 on the
+          # arm64 runner instead (Apple toolchains cross-link natively).
+          - os: macos-latest
             target: x86_64-apple-darwin
             archive: tar.gz
     runs-on: ${{ matrix.os }}
